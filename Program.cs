@@ -97,7 +97,7 @@ public sealed class ExporterConfig
     public int PollSeconds { get; init; } = 60;
     public int LookbackMinutes { get; init; } = 15;
     public string SqlConnectionString { get; init; } = "";
-    public string MetricPrefix { get; init; } = "veeam_server"; // new
+    public string MetricPrefix { get; init; } = "veeam_server";
 
     public static ExporterConfig Load(string path)
     {
@@ -111,17 +111,57 @@ public sealed class ExporterConfig
     private sealed class Root { public ExporterConfig Exporter { get; set; } = new(); }
 }
 
-public record MRow(string Host, string Key, string Inst, DateTime TsUtc, long Value);
+public record MRow(string Host, string Role, string Key, string InstLabel, string Inst, DateTime TsUtc, double Value);
 
 public sealed class MetricsCollector
 {
     private readonly ExporterConfig _cfg;
     private readonly object _lock = new();
-    private readonly string _p;               // sanitized prefix
+    private readonly string _p;
     private string _last = "# no data yet\n";
     private int _up = 0;
     private string _lastError = "none";
     private DateTimeOffset _lastSuccess = DateTimeOffset.FromUnixTimeSeconds(0);
+
+    private static readonly (string suffix, string help, string instLbl)[] MetricDefsArray = new[]
+    {
+        ("cpu_usage_percent", "CPU usage percent", ""),
+        ("memory_available_bytes", "Available memory in bytes", ""),
+        ("memory_used_bytes", "Used memory in bytes", ""),
+        ("memory_usage_percent", "Memory usage percent", ""),
+        ("disk_bytes_per_sec", "Disk bytes per second", "disk"),
+        ("disk_read_bytes_per_sec", "Disk read bytes per second", "disk"),
+        ("disk_write_bytes_per_sec", "Disk write bytes per second", "disk"),
+        ("net_bytes_sent_per_sec", "Network bytes sent per second", "iface"),
+        ("net_bytes_received_per_sec", "Network bytes received per second", "iface"),
+        ("net_bytes_total_per_sec", "Network total bytes per second", "iface"),
+        ("repository_used_bytes", "Repository used bytes", ""),
+        ("repository_capacity_bytes", "Repository capacity bytes", ""),
+        ("repository_free_bytes", "Repository free bytes", ""),
+        ("repository_file_backups_bytes", "Repository file backups bytes", ""),
+        ("repository_image_backups_bytes", "Repository image backups bytes", ""),
+        ("repository_app_backups_bytes", "Repository application backups bytes", ""),
+        ("repository_slots_used", "Repository used task slots", ""),
+        ("repository_slots_max", "Repository maximum task slots", ""),
+        ("proxy_slots_used", "Proxy used task slots", ""),
+        ("proxy_slots_max", "Proxy maximum task slots", ""),
+        ("cdp_sla_percent", "CDP SLA percent", ""),
+        ("cdp_max_delay_ms", "CDP maximum delay in milliseconds", ""),
+        ("cdp_proxy_cache_used_bytes", "CDP proxy cache used bytes", ""),
+        ("cdp_proxy_cache_capacity_bytes", "CDP proxy cache capacity bytes", ""),
+        ("cdp_proxy_cache_used_percent", "CDP proxy cache used percent", ""),
+        ("object_storage_used_bytes", "Object storage used bytes", ""),
+        ("object_storage_free_bytes", "Object storage free bytes", ""),
+        ("archiverep_used_bytes", "Archive repository used bytes", ""),
+        ("archiverep_capacity_bytes", "Archive repository capacity bytes", ""),
+        ("externalrep_used_bytes", "External repository used bytes", ""),
+        ("veeam_one_server_cpu_usage_percent", "Veeam ONE server CPU usage percent", ""),
+        ("veeam_one_server_memory_usage_percent", "Veeam ONE server memory usage percent", ""),
+        ("veeam_one_server_memory_pressure_percent", "Veeam ONE server memory pressure percent", "")
+    };
+
+    private static readonly Dictionary<string, (string suffix, string help, string instLbl)> MetricDefs =
+        MetricDefsArray.ToDictionary(x => x.suffix, x => x);
 
     public MetricsCollector(ExporterConfig cfg)
     {
@@ -129,7 +169,6 @@ public sealed class MetricsCollector
         _p = SanitizePrefix(cfg.MetricPrefix);
     }
 
-    // Build metric name: <prefix>_<suffix>
     private string M(string suffix) => $"{_p}_{suffix}";
 
     public string GetPayload()
@@ -138,7 +177,6 @@ public sealed class MetricsCollector
         {
             var sb = new StringBuilder();
 
-            // Top-level exporter health
             sb.Append($"# HELP {M("up")} Exporter health\n");
             sb.Append($"# TYPE {M("up")} gauge\n");
             sb.Append($"{M("up")} {_up}\n");
@@ -153,7 +191,6 @@ public sealed class MetricsCollector
             sb.Append($"# TYPE {M("last_scrape_error_info")} gauge\n");
             sb.Append($"{M("last_scrape_error_info")}{{message=\"{Esc(err)}\"}} 1\n");
 
-            // Collected metrics
             sb.Append(_last);
             return sb.ToString();
         }
@@ -183,44 +220,32 @@ public sealed class MetricsCollector
             var rows = await QueryAsync(ct);
 
             var sb = new StringBuilder();
-            // HELP/TYPE once per family using the prefix
-            sb.Append($"# HELP {M("net_bytes_sent_per_sec")} Network bytes sent per second\n");
-            sb.Append($"# TYPE {M("net_bytes_sent_per_sec")} gauge\n");
-            sb.Append($"# HELP {M("disk_bytes_per_sec")} Disk bytes per second\n");
-            sb.Append($"# TYPE {M("disk_bytes_per_sec")} gauge\n");
-            sb.Append($"# HELP {M("cpu_usage_percent")} CPU usage percent\n");
-            sb.Append($"# TYPE {M("cpu_usage_percent")} gauge\n");
-            sb.Append($"# HELP {M("memory_used_bytes")} Memory used in bytes\n");
-            sb.Append($"# TYPE {M("memory_used_bytes")} gauge\n");
+
+            var presentKeys = rows.Select(r => r.Key).Distinct().ToArray();
+            foreach (var key in presentKeys)
+            {
+                if (!MetricDefs.TryGetValue(key, out var def)) continue;
+                sb.Append($"# HELP {M(def.suffix)} {def.help}\n");
+                sb.Append($"# TYPE {M(def.suffix)} gauge\n");
+            }
 
             foreach (var r in rows)
             {
                 long tsMs = new DateTimeOffset(DateTime.SpecifyKind(r.TsUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
                 string host = Esc(r.Host);
+                string role = Esc(r.Role);
                 string inst = Esc(r.Inst);
 
-                switch (r.Key)
+                var labels = new StringBuilder();
+                labels.Append($"host=\"{host}\",role=\"{role}\"");
+
+                if (!string.IsNullOrEmpty(r.InstLabel) && !string.IsNullOrEmpty(inst))
                 {
-                    case "net_bytes_sent_per_sec":
-                        sb.Append($"{M("net_bytes_sent_per_sec")}{{host=\"{host}\"");
-                        if (!string.IsNullOrEmpty(inst)) sb.Append($",iface=\"{inst}\"");
-                        sb.Append($"}} {r.Value} {tsMs}\n");
-                        break;
-
-                    case "disk_bytes_per_sec":
-                        sb.Append($"{M("disk_bytes_per_sec")}{{host=\"{host}\"");
-                        if (!string.IsNullOrEmpty(inst)) sb.Append($",disk=\"{inst}\"");
-                        sb.Append($"}} {r.Value} {tsMs}\n");
-                        break;
-
-                    case "cpu_usage_pct":
-                        sb.Append($"{M("cpu_usage_percent")}{{host=\"{host}\"}} {r.Value} {tsMs}\n");
-                        break;
-
-                    case "memory_used_bytes":
-                        sb.Append($"{M("memory_used_bytes")}{{host=\"{host}\"}} {r.Value} {tsMs}\n");
-                        break;
+                    labels.Append($",");
+                    labels.Append($"{r.InstLabel}=\"{inst}\"");
                 }
+
+                sb.Append($"{M(r.Key)}{{{labels}}} {r.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)} {tsMs}\n");
             }
 
             lock (_lock)
@@ -244,11 +269,9 @@ public sealed class MetricsCollector
 
     private static string Esc(string s) => (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
 
-    // Keep prefix valid for Prometheus metric names
     private static string SanitizePrefix(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) raw = "exporter";
-        // letters, digits, underscore, colon; must start with letter or underscore
         var sb = new StringBuilder();
         foreach (var ch in raw)
         {
@@ -264,18 +287,121 @@ public sealed class MetricsCollector
     {
         const string sql = @"
 WITH metric_map AS (
-  SELECT 'bp.serv.networkInterface.bytesSentPerSec.average' AS string_id, 'net_bytes_sent_per_sec' AS counter_key
-  UNION ALL SELECT 'bp.serv.physicalDisk.BytesPerSec.average',           'disk_bytes_per_sec'
-  UNION ALL SELECT 'bp.serv.processorInformation.processorTimePct.average','cpu_usage_pct'
-  UNION ALL SELECT 'bp.serv.memory.usedBytes.average',                   'memory_used_bytes'
+  -- Common server families (em, serv, rep, prx, wac, tapeprx)
+  SELECT 'bp.em.memory.availableBytes.average'                    AS string_id, 'memory_available_bytes'           AS counter_key, NULL    AS inst_lbl
+  UNION ALL SELECT 'bp.em.memory.usedBytes.average',                                               'memory_used_bytes',               NULL
+  UNION ALL SELECT 'bp.em.networkInterface.bytesSentPerSec.average',                               'net_bytes_sent_per_sec',          'iface'
+  UNION ALL SELECT 'bp.em.physicalDisk.BytesPerSec.average',                                       'disk_bytes_per_sec',              'disk'
+  UNION ALL SELECT 'bp.em.processorInformation.processorTimePct.average',                          'cpu_usage_percent',               NULL
+
+  UNION ALL SELECT 'bp.serv.memory.availableBytes.average',                                        'memory_available_bytes',          NULL
+  UNION ALL SELECT 'bp.serv.memory.usedBytes.average',                                             'memory_used_bytes',               NULL
+  UNION ALL SELECT 'bp.serv.networkInterface.bytesSentPerSec.average',                             'net_bytes_sent_per_sec',          'iface'
+  UNION ALL SELECT 'bp.serv.physicalDisk.BytesPerSec.average',                                     'disk_bytes_per_sec',              'disk'
+  UNION ALL SELECT 'bp.serv.processorInformation.processorTimePct.average',                        'cpu_usage_percent',               NULL
+  UNION ALL SELECT 'bp.serv.cdp.slaCompliance.latest',                                             'cdp_sla_percent',                 NULL
+  UNION ALL SELECT 'bp.serv.cdp.MaxDelay.latest',                                                  'cdp_max_delay_ms',                NULL
+
+  UNION ALL SELECT 'bp.rep.memory.availableBytes.average',                                         'memory_available_bytes',          NULL
+  UNION ALL SELECT 'bp.rep.memory.usedBytes.average',                                              'memory_used_bytes',               NULL
+  UNION ALL SELECT 'bp.rep.networkInterface.bytesSentPerSec.average',                              'net_bytes_sent_per_sec',          'iface'
+  UNION ALL SELECT 'bp.rep.physicalDisk.BytesPerSec.average',                                      'disk_bytes_per_sec',              'disk'
+  UNION ALL SELECT 'bp.rep.processorInformation.processorTimePct.average',                         'cpu_usage_percent',               NULL
+  UNION ALL SELECT 'bp.rep.concurrentJobNum.latest',                                               'repository_slots_used',           NULL
+  UNION ALL SELECT 'bp.rep.concurrentJobMax.latest',                                               'repository_slots_max',            NULL
+
+  UNION ALL SELECT 'bp.repository.usedSpace.latest',                                               'repository_used_bytes',           NULL
+  UNION ALL SELECT 'bp.repository.capacity.latest',                                                'repository_capacity_bytes',       NULL
+  UNION ALL SELECT 'bp.repository.fileBackupsSize.latest',                                         'repository_file_backups_bytes',   NULL
+  UNION ALL SELECT 'bp.repository.imageBackupsSize.latest',                                        'repository_image_backups_bytes',  NULL
+  UNION ALL SELECT 'bp.repository.appBackupsSize.latest',                                          'repository_app_backups_bytes',    NULL
+
+  UNION ALL SELECT 'bp.prx.memory.availableBytes.average',                                         'memory_available_bytes',          NULL
+  UNION ALL SELECT 'bp.prx.memory.usedBytes.average',                                              'memory_used_bytes',               NULL
+  UNION ALL SELECT 'bp.prx.networkInterface.bytesSentPerSec.average',                              'net_bytes_sent_per_sec',          'iface'
+  UNION ALL SELECT 'bp.prx.physicalDisk.BytesPerSec.average',                                      'disk_bytes_per_sec',              'disk'
+  UNION ALL SELECT 'bp.prx.processorInformation.processorTimePct.average',                         'cpu_usage_percent',               NULL
+  UNION ALL SELECT 'bp.prx.concurrentJobNum.latest',                                               'proxy_slots_used',                NULL
+  UNION ALL SELECT 'bp.prx.concurrentJobMax.latest',                                               'proxy_slots_max',                 NULL
+  UNION ALL SELECT 'bp.prx.cdpcacheusage.latest',                                                  'cdp_proxy_cache_used_bytes',      NULL
+  UNION ALL SELECT 'bp.prx.cdpcachecapacity.latest',                                               'cdp_proxy_cache_capacity_bytes',  NULL
+  UNION ALL SELECT 'bp.prx.cdpcacheusagepercent.latest',                                           'cdp_proxy_cache_used_percent',    NULL
+
+  UNION ALL SELECT 'bp.wac.memory.availableBytes.average',                                         'memory_available_bytes',          NULL
+  UNION ALL SELECT 'bp.wac.memory.usedBytes.average',                                              'memory_used_bytes',               NULL
+  UNION ALL SELECT 'bp.wac.networkInterface.bytesSentPerSec.average',                              'net_bytes_sent_per_sec',          'iface'
+  UNION ALL SELECT 'bp.wac.physicalDisk.BytesPerSec.average',                                      'disk_bytes_per_sec',              'disk'
+  UNION ALL SELECT 'bp.wac.processorInformation.processorTimePct.average',                         'cpu_usage_percent',               NULL
+
+  UNION ALL SELECT 'bp.tapeprx.memory.availableBytes.average',                                     'memory_available_bytes',          NULL
+  UNION ALL SELECT 'bp.tapeprx.memory.usedBytes.average',                                          'memory_used_bytes',               NULL
+  UNION ALL SELECT 'bp.tapeprx.networkInterface.bytesSentPerSec.average',                          'net_bytes_sent_per_sec',          'iface'
+  UNION ALL SELECT 'bp.tapeprx.physicalDisk.BytesPerSec.average',                                  'disk_bytes_per_sec',              'disk'
+  UNION ALL SELECT 'bp.tapeprx.processorInformation.processorTimePct.average',                     'cpu_usage_percent',               NULL
+
+  -- Veeam Backup for Microsoft 365 server and proxy
+  UNION ALL SELECT 'vbm.srv.cpu.usage',                                                            'cpu_usage_percent',               NULL
+  UNION ALL SELECT 'vbm.srv.mem.available',                                                        'memory_available_bytes',          NULL
+  UNION ALL SELECT 'vbm.srv.mem.usage',                                                            'memory_used_bytes',               NULL
+  UNION ALL SELECT 'vbm.srv.disk.readBytesPerSec',                                                 'disk_read_bytes_per_sec',         'disk'
+  UNION ALL SELECT 'vbm.srv.disk.writeBytesPerSec',                                                'disk_write_bytes_per_sec',        'disk'
+  UNION ALL SELECT 'vbm.srv.disk.bytesPerSec',                                                     'disk_bytes_per_sec',              'disk'
+  UNION ALL SELECT 'vbm.srv.net.bytesPerSec',                                                      'net_bytes_total_per_sec',         'iface'
+  UNION ALL SELECT 'vbm.srv.net.bytesReceivedPersec',                                              'net_bytes_received_per_sec',      'iface'
+  UNION ALL SELECT 'vbm.srv.net.bytesSentPersec',                                                  'net_bytes_sent_per_sec',          'iface'
+
+  UNION ALL SELECT 'vbm.prx.cpu.usage',                                                            'cpu_usage_percent',               NULL
+  UNION ALL SELECT 'vbm.prx.mem.available',                                                        'memory_available_bytes',          NULL
+  UNION ALL SELECT 'vbm.prx.mem.usage',                                                            'memory_used_bytes',               NULL
+  UNION ALL SELECT 'vbm.prx.mem.usage.percent',                                                    'memory_usage_percent',            NULL
+  UNION ALL SELECT 'vbm.prx.disk.readBytesPerSec',                                                 'disk_read_bytes_per_sec',         'disk'
+  UNION ALL SELECT 'vbm.prx.disk.writeBytesPerSec',                                                'disk_write_bytes_per_sec',        'disk'
+  UNION ALL SELECT 'vbm.prx.disk.bytesPerSec',                                                     'disk_bytes_per_sec',              'disk'
+  UNION ALL SELECT 'vbm.prx.net.bytesPerSec',                                                      'net_bytes_total_per_sec',         'iface'
+  UNION ALL SELECT 'vbm.prx.net.bytesReceivedPersec',                                              'net_bytes_received_per_sec',      'iface'
+  UNION ALL SELECT 'vbm.prx.net.bytesSentPersec',                                                  'net_bytes_sent_per_sec',          'iface'
+
+  UNION ALL SELECT 'vbm.rep.usedSpace.latest',                                                     'repository_used_bytes',           NULL
+  UNION ALL SELECT 'vbm.rep.freeSpace.latest',                                                     'repository_free_bytes',           NULL
+  UNION ALL SELECT 'vbm.objrep.usedSpace.latest',                                                  'object_storage_used_bytes',       NULL
+  UNION ALL SELECT 'vbm.objrep.freeSpace.latest',                                                  'object_storage_free_bytes',       NULL
+
+  -- Archive and external repositories
+  UNION ALL SELECT 'bp.archiverep.usedSpace.latest',                                               'archiverep_used_bytes',           NULL
+  UNION ALL SELECT 'bp.archiverep.capacity.latest',                                                'archiverep_capacity_bytes',       NULL
+  UNION ALL SELECT 'bp.externalrep.usedSpace.latest',                                              'externalrep_used_bytes',          NULL
+
+  -- Veeam ONE server internals
+  UNION ALL SELECT 'veeam.srv.cpu.usage.average',                                                  'veeam_one_server_cpu_usage_percent',        NULL
+  UNION ALL SELECT 'veeam.srv.mem.usage.average',                                                  'veeam_one_server_memory_usage_percent',     NULL
+  UNION ALL SELECT 'veeam.srv.mem.pressure.average',                                               'veeam_one_server_memory_pressure_percent',  NULL
 ),
 base AS (
   SELECT
       COALESCE(NULLIF(LTRIM(RTRIM(e.host_name)), ''), NULLIF(LTRIM(RTRIM(e.name)), '')) AS host_name,
+      -- derive a compact role label from the string_id prefix
+      CASE
+        WHEN c.string_id LIKE 'bp.serv.%'        THEN 'serv'
+        WHEN c.string_id LIKE 'bp.em.%'          THEN 'em'
+        WHEN c.string_id LIKE 'bp.rep.%'         THEN 'rep'
+        WHEN c.string_id LIKE 'bp.repository.%'  THEN 'repository'
+        WHEN c.string_id LIKE 'bp.prx.%'         THEN 'prx'
+        WHEN c.string_id LIKE 'bp.wac.%'         THEN 'wac'
+        WHEN c.string_id LIKE 'bp.tapeprx.%'     THEN 'tapeprx'
+        WHEN c.string_id LIKE 'bp.archiverep.%'  THEN 'archiverep'
+        WHEN c.string_id LIKE 'bp.externalrep.%' THEN 'externalrep'
+        WHEN c.string_id LIKE 'vbm.srv.%'        THEN 'vbm_srv'
+        WHEN c.string_id LIKE 'vbm.prx.%'        THEN 'vbm_prx'
+        WHEN c.string_id LIKE 'vbm.rep.%'        THEN 'vbm_rep'
+        WHEN c.string_id LIKE 'vbm.objrep.%'     THEN 'vbm_objrep'
+        WHEN c.string_id LIKE 'veeam.srv.%'      THEN 'veeam_srv'
+        ELSE 'other'
+      END AS role,
       m.counter_key,
+      m.inst_lbl,
       NULLIF(LTRIM(RTRIM(i.name)), '') AS instance_name,
       s.[timestamp] AS ts_utc,
-      CAST(s.value AS BIGINT) AS value,
+      CONVERT(float, s.value) / NULLIF(CONVERT(float, c.divider), 0) AS value_scaled,
       e.id AS entity_id,
       s.instance_id,
       s.counter_id,
@@ -290,7 +416,7 @@ base AS (
   JOIN metric_map               m ON m.string_id = c.string_id
   WHERE s.[timestamp] >= DATEADD(minute, -@lookback, SYSUTCDATETIME())
 )
-SELECT host_name, counter_key, instance_name, ts_utc, value
+SELECT host_name, role, counter_key, inst_lbl, instance_name, ts_utc, value_scaled
 FROM base
 WHERE rn = 1
   AND host_name IS NOT NULL;";
@@ -306,11 +432,14 @@ WHERE rn = 1
         while (await r.ReadAsync(ct))
         {
             string host = r.GetString(0);
-            string key  = r.GetString(1);
-            string inst = r.IsDBNull(2) ? "" : r.GetString(2);
-            DateTime ts = r.GetDateTime(3);
-            long val    = Convert.ToInt64(r.GetValue(4));
-            list.Add(new MRow(host, key, inst, ts, val));
+            string role = r.GetString(1);
+            string key  = r.GetString(2);
+            string instLbl = r.IsDBNull(3) ? "" : r.GetString(3);
+            string inst = r.IsDBNull(4) ? "" : r.GetString(4);
+            DateTime ts = r.GetDateTime(5);
+            double val  = Convert.ToDouble(r.GetValue(6));
+            if (!MetricDefs.ContainsKey(key)) continue;
+            list.Add(new MRow(host, role, key, instLbl, inst, ts, val));
         }
         return list;
     }
