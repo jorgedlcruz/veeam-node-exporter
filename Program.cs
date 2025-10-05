@@ -1,6 +1,12 @@
+using System;
+using System.IO;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Linq;
+using System.Collections.Generic;
 using Microsoft.Data.SqlClient;
 
 var cfg = ExporterConfig.Load("appsettings.json");
@@ -95,7 +101,7 @@ public sealed class ExporterConfig
 {
     public string ListenUrl { get; init; } = "http://127.0.0.1:9108/";
     public int PollSeconds { get; init; } = 60;
-    public int LookbackMinutes { get; init; } = 15;
+    public int LookbackMinutes { get; init; } = 65; // 65 to safely cover last hour
     public string SqlConnectionString { get; init; } = "";
     public string MetricPrefix { get; init; } = "veeam_server";
 
@@ -123,6 +129,7 @@ public sealed class MetricsCollector
     private string _lastError = "none";
     private DateTimeOffset _lastSuccess = DateTimeOffset.FromUnixTimeSeconds(0);
 
+    // key -> (suffix, help, instance label)
     private static readonly (string suffix, string help, string instLbl)[] MetricDefsArray = new[]
     {
         ("cpu_usage_percent", "CPU usage percent", ""),
@@ -221,6 +228,7 @@ public sealed class MetricsCollector
 
             var sb = new StringBuilder();
 
+            // HELP/TYPE for present keys
             var presentKeys = rows.Select(r => r.Key).Distinct().ToArray();
             foreach (var key in presentKeys)
             {
@@ -238,12 +246,8 @@ public sealed class MetricsCollector
 
                 var labels = new StringBuilder();
                 labels.Append($"host=\"{host}\",role=\"{role}\"");
-
                 if (!string.IsNullOrEmpty(r.InstLabel) && !string.IsNullOrEmpty(inst))
-                {
-                    labels.Append($",");
-                    labels.Append($"{r.InstLabel}=\"{inst}\"");
-                }
+                    labels.Append($",{r.InstLabel}=\"{inst}\"");
 
                 sb.Append($"{M(r.Key)}{{{labels}}} {r.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)} {tsMs}\n");
             }
@@ -285,8 +289,41 @@ public sealed class MetricsCollector
 
     private async Task<List<MRow>> QueryAsync(CancellationToken ct)
     {
-        const string sql = @"
-WITH metric_map AS (
+        using var conn = new SqlConnection(_cfg.SqlConnectionString);
+        await conn.OpenAsync(ct);
+
+        // Find all 1-minute partitions
+        var lowTables = new List<string>();
+        using (var cmdNames = conn.CreateCommand())
+        {
+            cmdNames.CommandText = @"
+                SELECT QUOTENAME(s.name) + '.' + QUOTENAME(t.name)
+                FROM sys.tables t
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                WHERE t.name LIKE 'PerfSampleLow%'";
+            using var rd = await cmdNames.ExecuteReaderAsync(ct);
+            while (await rd.ReadAsync(ct)) lowTables.Add(rd.GetString(0));
+        }
+
+        string lowUnion;
+        if (lowTables.Count > 0)
+        {
+            var selects = lowTables
+                .OrderBy(n => n)
+                .Select(n => $"SELECT instance_id, counter_id, [timestamp], interval, value FROM {n}");
+            lowUnion = string.Join("\nUNION ALL\n", selects);
+        }
+        else
+        {
+            // Fallback if Low partitions are absent
+            lowUnion = "SELECT instance_id, counter_id, [timestamp], interval, value FROM monitor.PerfSample";
+        }
+
+        string sql = $@"
+WITH S AS (
+  {lowUnion}
+),
+metric_map AS (
   -- Common server families (em, serv, rep, prx, wac, tapeprx)
   SELECT 'bp.em.memory.availableBytes.average'                    AS string_id, 'memory_available_bytes'           AS counter_key, NULL    AS inst_lbl
   UNION ALL SELECT 'bp.em.memory.usedBytes.average',                                               'memory_used_bytes',               NULL
@@ -379,7 +416,6 @@ WITH metric_map AS (
 base AS (
   SELECT
       COALESCE(NULLIF(LTRIM(RTRIM(e.host_name)), ''), NULLIF(LTRIM(RTRIM(e.name)), '')) AS host_name,
-      -- derive a compact role label from the string_id prefix
       CASE
         WHEN c.string_id LIKE 'bp.serv.%'        THEN 'serv'
         WHEN c.string_id LIKE 'bp.em.%'          THEN 'em'
@@ -409,12 +445,14 @@ base AS (
         PARTITION BY e.id, s.instance_id, s.counter_id
         ORDER BY s.[timestamp] DESC
       ) AS rn
-  FROM monitor.PerfSample s
+  FROM S s
   JOIN monitor.PerfInstance     i ON i.id = s.instance_id
   JOIN monitor.PerfCounterInfo  c ON c.id = s.counter_id
   JOIN monitor.Entity           e ON e.id = i.entity_id
   JOIN metric_map               m ON m.string_id = c.string_id
   WHERE s.[timestamp] >= DATEADD(minute, -@lookback, SYSUTCDATETIME())
+    AND c.rt_interval > 0
+    AND s.interval = c.rt_interval   -- force 1-minute resolution when available
 )
 SELECT host_name, role, counter_key, inst_lbl, instance_name, ts_utc, value_scaled
 FROM base
@@ -422,11 +460,12 @@ WHERE rn = 1
   AND host_name IS NOT NULL;";
 
         var list = new List<MRow>();
-        using var conn = new SqlConnection(_cfg.SqlConnectionString);
-        await conn.OpenAsync(ct);
         using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
-        cmd.Parameters.Add(new SqlParameter("@lookback", System.Data.SqlDbType.Int) { Value = Math.Max(1, _cfg.LookbackMinutes) });
+        cmd.Parameters.Add(new SqlParameter("@lookback", System.Data.SqlDbType.Int)
+        {
+            Value = Math.Max(1, _cfg.LookbackMinutes)
+        });
 
         using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct))
