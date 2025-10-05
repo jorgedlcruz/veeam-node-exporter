@@ -101,9 +101,9 @@ public sealed class ExporterConfig
 {
     public string ListenUrl { get; init; } = "http://127.0.0.1:9108/";
     public int PollSeconds { get; init; } = 60;
-    public int LookbackMinutes { get; init; } = 65; // 65 to safely cover last hour
+    public int LookbackMinutes { get; init; } = 65;
     public string SqlConnectionString { get; init; } = "";
-    public string MetricPrefix { get; init; } = "veeam_server";
+    public string MetricPrefix { get; init; } = "vone_exporter";
 
     public static ExporterConfig Load(string path)
     {
@@ -129,7 +129,6 @@ public sealed class MetricsCollector
     private string _lastError = "none";
     private DateTimeOffset _lastSuccess = DateTimeOffset.FromUnixTimeSeconds(0);
 
-    // key -> (suffix, help, instance label)
     private static readonly (string suffix, string help, string instLbl)[] MetricDefsArray = new[]
     {
         ("cpu_usage_percent", "CPU usage percent", ""),
@@ -228,7 +227,6 @@ public sealed class MetricsCollector
 
             var sb = new StringBuilder();
 
-            // HELP/TYPE for present keys
             var presentKeys = rows.Select(r => r.Key).Distinct().ToArray();
             foreach (var key in presentKeys)
             {
@@ -289,183 +287,150 @@ public sealed class MetricsCollector
 
     private async Task<List<MRow>> QueryAsync(CancellationToken ct)
     {
-        using var conn = new SqlConnection(_cfg.SqlConnectionString);
-        await conn.OpenAsync(ct);
+        const string sql = @"
+    WITH metric_map (string_id, counter_key, inst_lbl) AS (
+    -- map string_id -> exporter key + optional instance label
+    SELECT 'bp.em.memory.availableBytes.average','memory_available_bytes',NULL UNION ALL
+    SELECT 'bp.em.memory.usedBytes.average','memory_used_bytes',NULL UNION ALL
+    SELECT 'bp.em.networkInterface.bytesSentPerSec.average','net_bytes_sent_per_sec','iface' UNION ALL
+    SELECT 'bp.em.physicalDisk.BytesPerSec.average','disk_bytes_per_sec','disk' UNION ALL
+    SELECT 'bp.em.processorInformation.processorTimePct.average','cpu_usage_percent',NULL UNION ALL
 
-        // Find all 1-minute partitions
-        var lowTables = new List<string>();
-        using (var cmdNames = conn.CreateCommand())
-        {
-            cmdNames.CommandText = @"
-                SELECT QUOTENAME(s.name) + '.' + QUOTENAME(t.name)
-                FROM sys.tables t
-                JOIN sys.schemas s ON s.schema_id = t.schema_id
-                WHERE t.name LIKE 'PerfSampleLow%'";
-            using var rd = await cmdNames.ExecuteReaderAsync(ct);
-            while (await rd.ReadAsync(ct)) lowTables.Add(rd.GetString(0));
-        }
+    SELECT 'bp.serv.memory.availableBytes.average','memory_available_bytes',NULL UNION ALL
+    SELECT 'bp.serv.memory.usedBytes.average','memory_used_bytes',NULL UNION ALL
+    SELECT 'bp.serv.networkInterface.bytesSentPerSec.average','net_bytes_sent_per_sec','iface' UNION ALL
+    SELECT 'bp.serv.physicalDisk.BytesPerSec.average','disk_bytes_per_sec','disk' UNION ALL
+    SELECT 'bp.serv.processorInformation.processorTimePct.average','cpu_usage_percent',NULL UNION ALL
+    SELECT 'bp.serv.cdp.slaCompliance.latest','cdp_sla_percent',NULL UNION ALL
+    SELECT 'bp.serv.cdp.MaxDelay.latest','cdp_max_delay_ms',NULL UNION ALL
 
-        string lowUnion;
-        if (lowTables.Count > 0)
-        {
-            var selects = lowTables
-                .OrderBy(n => n)
-                .Select(n => $"SELECT instance_id, counter_id, [timestamp], interval, value FROM {n}");
-            lowUnion = string.Join("\nUNION ALL\n", selects);
-        }
-        else
-        {
-            // Fallback if Low partitions are absent
-            lowUnion = "SELECT instance_id, counter_id, [timestamp], interval, value FROM monitor.PerfSample";
-        }
+    SELECT 'bp.rep.memory.availableBytes.average','memory_available_bytes',NULL UNION ALL
+    SELECT 'bp.rep.memory.usedBytes.average','memory_used_bytes',NULL UNION ALL
+    SELECT 'bp.rep.networkInterface.bytesSentPerSec.average','net_bytes_sent_per_sec','iface' UNION ALL
+    SELECT 'bp.rep.physicalDisk.BytesPerSec.average','disk_bytes_per_sec','disk' UNION ALL
+    SELECT 'bp.rep.processorInformation.processorTimePct.average','cpu_usage_percent',NULL UNION ALL
+    SELECT 'bp.rep.concurrentJobNum.latest','repository_slots_used',NULL UNION ALL
+    SELECT 'bp.rep.concurrentJobMax.latest','repository_slots_max',NULL UNION ALL
 
-        string sql = $@"
-WITH S AS (
-  {lowUnion}
-),
-metric_map AS (
-  -- Common server families (em, serv, rep, prx, wac, tapeprx)
-  SELECT 'bp.em.memory.availableBytes.average'                    AS string_id, 'memory_available_bytes'           AS counter_key, NULL    AS inst_lbl
-  UNION ALL SELECT 'bp.em.memory.usedBytes.average',                                               'memory_used_bytes',               NULL
-  UNION ALL SELECT 'bp.em.networkInterface.bytesSentPerSec.average',                               'net_bytes_sent_per_sec',          'iface'
-  UNION ALL SELECT 'bp.em.physicalDisk.BytesPerSec.average',                                       'disk_bytes_per_sec',              'disk'
-  UNION ALL SELECT 'bp.em.processorInformation.processorTimePct.average',                          'cpu_usage_percent',               NULL
+    SELECT 'bp.repository.usedSpace.latest','repository_used_bytes',NULL UNION ALL
+    SELECT 'bp.repository.capacity.latest','repository_capacity_bytes',NULL UNION ALL
+    SELECT 'bp.repository.fileBackupsSize.latest','repository_file_backups_bytes',NULL UNION ALL
+    SELECT 'bp.repository.imageBackupsSize.latest','repository_image_backups_bytes',NULL UNION ALL
+    SELECT 'bp.repository.appBackupsSize.latest','repository_app_backups_bytes',NULL UNION ALL
 
-  UNION ALL SELECT 'bp.serv.memory.availableBytes.average',                                        'memory_available_bytes',          NULL
-  UNION ALL SELECT 'bp.serv.memory.usedBytes.average',                                             'memory_used_bytes',               NULL
-  UNION ALL SELECT 'bp.serv.networkInterface.bytesSentPerSec.average',                             'net_bytes_sent_per_sec',          'iface'
-  UNION ALL SELECT 'bp.serv.physicalDisk.BytesPerSec.average',                                     'disk_bytes_per_sec',              'disk'
-  UNION ALL SELECT 'bp.serv.processorInformation.processorTimePct.average',                        'cpu_usage_percent',               NULL
-  UNION ALL SELECT 'bp.serv.cdp.slaCompliance.latest',                                             'cdp_sla_percent',                 NULL
-  UNION ALL SELECT 'bp.serv.cdp.MaxDelay.latest',                                                  'cdp_max_delay_ms',                NULL
+    SELECT 'bp.prx.memory.availableBytes.average','memory_available_bytes',NULL UNION ALL
+    SELECT 'bp.prx.memory.usedBytes.average','memory_used_bytes',NULL UNION ALL
+    SELECT 'bp.prx.networkInterface.bytesSentPerSec.average','net_bytes_sent_per_sec','iface' UNION ALL
+    SELECT 'bp.prx.physicalDisk.BytesPerSec.average','disk_bytes_per_sec','disk' UNION ALL
+    SELECT 'bp.prx.processorInformation.processorTimePct.average','cpu_usage_percent',NULL UNION ALL
+    SELECT 'bp.prx.concurrentJobNum.latest','proxy_slots_used',NULL UNION ALL
+    SELECT 'bp.prx.concurrentJobMax.latest','proxy_slots_max',NULL UNION ALL
+    SELECT 'bp.prx.cdpcacheusage.latest','cdp_proxy_cache_used_bytes',NULL UNION ALL
+    SELECT 'bp.prx.cdpcachecapacity.latest','cdp_proxy_cache_capacity_bytes',NULL UNION ALL
+    SELECT 'bp.prx.cdpcacheusagepercent.latest','cdp_proxy_cache_used_percent',NULL UNION ALL
 
-  UNION ALL SELECT 'bp.rep.memory.availableBytes.average',                                         'memory_available_bytes',          NULL
-  UNION ALL SELECT 'bp.rep.memory.usedBytes.average',                                              'memory_used_bytes',               NULL
-  UNION ALL SELECT 'bp.rep.networkInterface.bytesSentPerSec.average',                              'net_bytes_sent_per_sec',          'iface'
-  UNION ALL SELECT 'bp.rep.physicalDisk.BytesPerSec.average',                                      'disk_bytes_per_sec',              'disk'
-  UNION ALL SELECT 'bp.rep.processorInformation.processorTimePct.average',                         'cpu_usage_percent',               NULL
-  UNION ALL SELECT 'bp.rep.concurrentJobNum.latest',                                               'repository_slots_used',           NULL
-  UNION ALL SELECT 'bp.rep.concurrentJobMax.latest',                                               'repository_slots_max',            NULL
+    SELECT 'bp.wac.memory.availableBytes.average','memory_available_bytes',NULL UNION ALL
+    SELECT 'bp.wac.memory.usedBytes.average','memory_used_bytes',NULL UNION ALL
+    SELECT 'bp.wac.networkInterface.bytesSentPerSec.average','net_bytes_sent_per_sec','iface' UNION ALL
+    SELECT 'bp.wac.physicalDisk.BytesPerSec.average','disk_bytes_per_sec','disk' UNION ALL
+    SELECT 'bp.wac.processorInformation.processorTimePct.average','cpu_usage_percent',NULL UNION ALL
 
-  UNION ALL SELECT 'bp.repository.usedSpace.latest',                                               'repository_used_bytes',           NULL
-  UNION ALL SELECT 'bp.repository.capacity.latest',                                                'repository_capacity_bytes',       NULL
-  UNION ALL SELECT 'bp.repository.fileBackupsSize.latest',                                         'repository_file_backups_bytes',   NULL
-  UNION ALL SELECT 'bp.repository.imageBackupsSize.latest',                                        'repository_image_backups_bytes',  NULL
-  UNION ALL SELECT 'bp.repository.appBackupsSize.latest',                                          'repository_app_backups_bytes',    NULL
+    SELECT 'bp.tapeprx.memory.availableBytes.average','memory_available_bytes',NULL UNION ALL
+    SELECT 'bp.tapeprx.memory.usedBytes.average','memory_used_bytes',NULL UNION ALL
+    SELECT 'bp.tapeprx.networkInterface.bytesSentPerSec.average','net_bytes_sent_per_sec','iface' UNION ALL
+    SELECT 'bp.tapeprx.physicalDisk.BytesPerSec.average','disk_bytes_per_sec','disk' UNION ALL
+    SELECT 'bp.tapeprx.processorInformation.processorTimePct.average','cpu_usage_percent',NULL UNION ALL
 
-  UNION ALL SELECT 'bp.prx.memory.availableBytes.average',                                         'memory_available_bytes',          NULL
-  UNION ALL SELECT 'bp.prx.memory.usedBytes.average',                                              'memory_used_bytes',               NULL
-  UNION ALL SELECT 'bp.prx.networkInterface.bytesSentPerSec.average',                              'net_bytes_sent_per_sec',          'iface'
-  UNION ALL SELECT 'bp.prx.physicalDisk.BytesPerSec.average',                                      'disk_bytes_per_sec',              'disk'
-  UNION ALL SELECT 'bp.prx.processorInformation.processorTimePct.average',                         'cpu_usage_percent',               NULL
-  UNION ALL SELECT 'bp.prx.concurrentJobNum.latest',                                               'proxy_slots_used',                NULL
-  UNION ALL SELECT 'bp.prx.concurrentJobMax.latest',                                               'proxy_slots_max',                 NULL
-  UNION ALL SELECT 'bp.prx.cdpcacheusage.latest',                                                  'cdp_proxy_cache_used_bytes',      NULL
-  UNION ALL SELECT 'bp.prx.cdpcachecapacity.latest',                                               'cdp_proxy_cache_capacity_bytes',  NULL
-  UNION ALL SELECT 'bp.prx.cdpcacheusagepercent.latest',                                           'cdp_proxy_cache_used_percent',    NULL
+    SELECT 'vbm.srv.cpu.usage','cpu_usage_percent',NULL UNION ALL
+    SELECT 'vbm.srv.mem.available','memory_available_bytes',NULL UNION ALL
+    SELECT 'vbm.srv.mem.usage','memory_used_bytes',NULL UNION ALL
+    SELECT 'vbm.srv.disk.readBytesPerSec','disk_read_bytes_per_sec','disk' UNION ALL
+    SELECT 'vbm.srv.disk.writeBytesPerSec','disk_write_bytes_per_sec','disk' UNION ALL
+    SELECT 'vbm.srv.disk.bytesPerSec','disk_bytes_per_sec','disk' UNION ALL
+    SELECT 'vbm.srv.net.bytesPerSec','net_bytes_total_per_sec','iface' UNION ALL
+    SELECT 'vbm.srv.net.bytesReceivedPersec','net_bytes_received_per_sec','iface' UNION ALL
+    SELECT 'vbm.srv.net.bytesSentPersec','net_bytes_sent_per_sec','iface' UNION ALL
 
-  UNION ALL SELECT 'bp.wac.memory.availableBytes.average',                                         'memory_available_bytes',          NULL
-  UNION ALL SELECT 'bp.wac.memory.usedBytes.average',                                              'memory_used_bytes',               NULL
-  UNION ALL SELECT 'bp.wac.networkInterface.bytesSentPerSec.average',                              'net_bytes_sent_per_sec',          'iface'
-  UNION ALL SELECT 'bp.wac.physicalDisk.BytesPerSec.average',                                      'disk_bytes_per_sec',              'disk'
-  UNION ALL SELECT 'bp.wac.processorInformation.processorTimePct.average',                         'cpu_usage_percent',               NULL
+    SELECT 'vbm.prx.cpu.usage','cpu_usage_percent',NULL UNION ALL
+    SELECT 'vbm.prx.mem.available','memory_available_bytes',NULL UNION ALL
+    SELECT 'vbm.prx.mem.usage','memory_used_bytes',NULL UNION ALL
+    SELECT 'vbm.prx.mem.usage.percent','memory_usage_percent',NULL UNION ALL
+    SELECT 'vbm.prx.disk.readBytesPerSec','disk_read_bytes_per_sec','disk' UNION ALL
+    SELECT 'vbm.prx.disk.writeBytesPerSec','disk_write_bytes_per_sec','disk' UNION ALL
+    SELECT 'vbm.prx.disk.bytesPerSec','disk_bytes_per_sec','disk' UNION ALL
+    SELECT 'vbm.prx.net.bytesPerSec','net_bytes_total_per_sec','iface' UNION ALL
+    SELECT 'vbm.prx.net.bytesReceivedPersec','net_bytes_received_per_sec','iface' UNION ALL
+    SELECT 'vbm.prx.net.bytesSentPersec','net_bytes_sent_per_sec','iface' UNION ALL
 
-  UNION ALL SELECT 'bp.tapeprx.memory.availableBytes.average',                                     'memory_available_bytes',          NULL
-  UNION ALL SELECT 'bp.tapeprx.memory.usedBytes.average',                                          'memory_used_bytes',               NULL
-  UNION ALL SELECT 'bp.tapeprx.networkInterface.bytesSentPerSec.average',                          'net_bytes_sent_per_sec',          'iface'
-  UNION ALL SELECT 'bp.tapeprx.physicalDisk.BytesPerSec.average',                                  'disk_bytes_per_sec',              'disk'
-  UNION ALL SELECT 'bp.tapeprx.processorInformation.processorTimePct.average',                     'cpu_usage_percent',               NULL
+    SELECT 'vbm.rep.usedSpace.latest','repository_used_bytes',NULL UNION ALL
+    SELECT 'vbm.rep.freeSpace.latest','repository_free_bytes',NULL UNION ALL
+    SELECT 'vbm.objrep.usedSpace.latest','object_storage_used_bytes',NULL UNION ALL
+    SELECT 'vbm.objrep.freeSpace.latest','object_storage_free_bytes',NULL UNION ALL
 
-  -- Veeam Backup for Microsoft 365 server and proxy
-  UNION ALL SELECT 'vbm.srv.cpu.usage',                                                            'cpu_usage_percent',               NULL
-  UNION ALL SELECT 'vbm.srv.mem.available',                                                        'memory_available_bytes',          NULL
-  UNION ALL SELECT 'vbm.srv.mem.usage',                                                            'memory_used_bytes',               NULL
-  UNION ALL SELECT 'vbm.srv.disk.readBytesPerSec',                                                 'disk_read_bytes_per_sec',         'disk'
-  UNION ALL SELECT 'vbm.srv.disk.writeBytesPerSec',                                                'disk_write_bytes_per_sec',        'disk'
-  UNION ALL SELECT 'vbm.srv.disk.bytesPerSec',                                                     'disk_bytes_per_sec',              'disk'
-  UNION ALL SELECT 'vbm.srv.net.bytesPerSec',                                                      'net_bytes_total_per_sec',         'iface'
-  UNION ALL SELECT 'vbm.srv.net.bytesReceivedPersec',                                              'net_bytes_received_per_sec',      'iface'
-  UNION ALL SELECT 'vbm.srv.net.bytesSentPersec',                                                  'net_bytes_sent_per_sec',          'iface'
+    SELECT 'bp.archiverep.usedSpace.latest','archiverep_used_bytes',NULL UNION ALL
+    SELECT 'bp.archiverep.capacity.latest','archiverep_capacity_bytes',NULL UNION ALL
+    SELECT 'bp.externalrep.usedSpace.latest','externalrep_used_bytes',NULL UNION ALL
 
-  UNION ALL SELECT 'vbm.prx.cpu.usage',                                                            'cpu_usage_percent',               NULL
-  UNION ALL SELECT 'vbm.prx.mem.available',                                                        'memory_available_bytes',          NULL
-  UNION ALL SELECT 'vbm.prx.mem.usage',                                                            'memory_used_bytes',               NULL
-  UNION ALL SELECT 'vbm.prx.mem.usage.percent',                                                    'memory_usage_percent',            NULL
-  UNION ALL SELECT 'vbm.prx.disk.readBytesPerSec',                                                 'disk_read_bytes_per_sec',         'disk'
-  UNION ALL SELECT 'vbm.prx.disk.writeBytesPerSec',                                                'disk_write_bytes_per_sec',        'disk'
-  UNION ALL SELECT 'vbm.prx.disk.bytesPerSec',                                                     'disk_bytes_per_sec',              'disk'
-  UNION ALL SELECT 'vbm.prx.net.bytesPerSec',                                                      'net_bytes_total_per_sec',         'iface'
-  UNION ALL SELECT 'vbm.prx.net.bytesReceivedPersec',                                              'net_bytes_received_per_sec',      'iface'
-  UNION ALL SELECT 'vbm.prx.net.bytesSentPersec',                                                  'net_bytes_sent_per_sec',          'iface'
-
-  UNION ALL SELECT 'vbm.rep.usedSpace.latest',                                                     'repository_used_bytes',           NULL
-  UNION ALL SELECT 'vbm.rep.freeSpace.latest',                                                     'repository_free_bytes',           NULL
-  UNION ALL SELECT 'vbm.objrep.usedSpace.latest',                                                  'object_storage_used_bytes',       NULL
-  UNION ALL SELECT 'vbm.objrep.freeSpace.latest',                                                  'object_storage_free_bytes',       NULL
-
-  -- Archive and external repositories
-  UNION ALL SELECT 'bp.archiverep.usedSpace.latest',                                               'archiverep_used_bytes',           NULL
-  UNION ALL SELECT 'bp.archiverep.capacity.latest',                                                'archiverep_capacity_bytes',       NULL
-  UNION ALL SELECT 'bp.externalrep.usedSpace.latest',                                              'externalrep_used_bytes',          NULL
-
-  -- Veeam ONE server internals
-  UNION ALL SELECT 'veeam.srv.cpu.usage.average',                                                  'veeam_one_server_cpu_usage_percent',        NULL
-  UNION ALL SELECT 'veeam.srv.mem.usage.average',                                                  'veeam_one_server_memory_usage_percent',     NULL
-  UNION ALL SELECT 'veeam.srv.mem.pressure.average',                                               'veeam_one_server_memory_pressure_percent',  NULL
-),
-base AS (
-  SELECT
-      COALESCE(NULLIF(LTRIM(RTRIM(e.host_name)), ''), NULLIF(LTRIM(RTRIM(e.name)), '')) AS host_name,
-      CASE
-        WHEN c.string_id LIKE 'bp.serv.%'        THEN 'serv'
-        WHEN c.string_id LIKE 'bp.em.%'          THEN 'em'
-        WHEN c.string_id LIKE 'bp.rep.%'         THEN 'rep'
-        WHEN c.string_id LIKE 'bp.repository.%'  THEN 'repository'
-        WHEN c.string_id LIKE 'bp.prx.%'         THEN 'prx'
-        WHEN c.string_id LIKE 'bp.wac.%'         THEN 'wac'
-        WHEN c.string_id LIKE 'bp.tapeprx.%'     THEN 'tapeprx'
-        WHEN c.string_id LIKE 'bp.archiverep.%'  THEN 'archiverep'
-        WHEN c.string_id LIKE 'bp.externalrep.%' THEN 'externalrep'
-        WHEN c.string_id LIKE 'vbm.srv.%'        THEN 'vbm_srv'
-        WHEN c.string_id LIKE 'vbm.prx.%'        THEN 'vbm_prx'
-        WHEN c.string_id LIKE 'vbm.rep.%'        THEN 'vbm_rep'
-        WHEN c.string_id LIKE 'vbm.objrep.%'     THEN 'vbm_objrep'
-        WHEN c.string_id LIKE 'veeam.srv.%'      THEN 'veeam_srv'
-        ELSE 'other'
-      END AS role,
-      m.counter_key,
-      m.inst_lbl,
-      NULLIF(LTRIM(RTRIM(i.name)), '') AS instance_name,
-      s.[timestamp] AS ts_utc,
-      CONVERT(float, s.value) / NULLIF(CONVERT(float, c.divider), 0) AS value_scaled,
-      e.id AS entity_id,
-      s.instance_id,
-      s.counter_id,
-      ROW_NUMBER() OVER (
-        PARTITION BY e.id, s.instance_id, s.counter_id
-        ORDER BY s.[timestamp] DESC
-      ) AS rn
-  FROM S s
-  JOIN monitor.PerfInstance     i ON i.id = s.instance_id
-  JOIN monitor.PerfCounterInfo  c ON c.id = s.counter_id
-  JOIN monitor.Entity           e ON e.id = i.entity_id
-  JOIN metric_map               m ON m.string_id = c.string_id
-  WHERE s.[timestamp] >= DATEADD(minute, -@lookback, SYSUTCDATETIME())
-    AND c.rt_interval > 0
-    AND s.interval = c.rt_interval   -- force 1-minute resolution when available
-)
-SELECT host_name, role, counter_key, inst_lbl, instance_name, ts_utc, value_scaled
-FROM base
-WHERE rn = 1
-  AND host_name IS NOT NULL;";
+    SELECT 'veeam.srv.cpu.usage.average','veeam_one_server_cpu_usage_percent',NULL UNION ALL
+    SELECT 'veeam.srv.mem.usage.average','veeam_one_server_memory_usage_percent',NULL UNION ALL
+    SELECT 'veeam.srv.mem.pressure.average','veeam_one_server_memory_pressure_percent',NULL
+    ),
+    base AS (
+    SELECT
+        COALESCE(NULLIF(LTRIM(RTRIM(e.host_name)), ''), NULLIF(LTRIM(RTRIM(e.name)), '')) AS host_name,
+        CASE
+            WHEN c.string_id LIKE 'bp.serv.%'        THEN 'serv'
+            WHEN c.string_id LIKE 'bp.em.%'          THEN 'em'
+            WHEN c.string_id LIKE 'bp.rep.%'         THEN 'rep'
+            WHEN c.string_id LIKE 'bp.repository.%'  THEN 'repository'
+            WHEN c.string_id LIKE 'bp.prx.%'         THEN 'prx'
+            WHEN c.string_id LIKE 'bp.wac.%'         THEN 'wac'
+            WHEN c.string_id LIKE 'bp.tapeprx.%'     THEN 'tapeprx'
+            WHEN c.string_id LIKE 'bp.archiverep.%'  THEN 'archiverep'
+            WHEN c.string_id LIKE 'bp.externalrep.%' THEN 'externalrep'
+            WHEN c.string_id LIKE 'vbm.srv.%'        THEN 'vbm_srv'
+            WHEN c.string_id LIKE 'vbm.prx.%'        THEN 'vbm_prx'
+            WHEN c.string_id LIKE 'vbm.rep.%'        THEN 'vbm_rep'
+            WHEN c.string_id LIKE 'vbm.objrep.%'     THEN 'vbm_objrep'
+            WHEN c.string_id LIKE 'veeam.srv.%'      THEN 'veeam_srv'
+            ELSE 'other'
+        END AS role,
+        m.counter_key,
+        m.inst_lbl,
+        NULLIF(LTRIM(RTRIM(i.name)), '') AS instance_name,
+        s.[timestamp] AS ts_utc,
+        CONVERT(float, s.value) / NULLIF(CONVERT(float, c.divider), 0) AS value_scaled,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.id, s.instance_id, s.counter_id
+            ORDER BY
+            CASE
+                WHEN c.rt_interval     > 0 AND s.interval = c.rt_interval     THEN 0
+                WHEN c.level2_interval > 0 AND s.interval = c.level2_interval THEN 1
+                WHEN c.level3_interval > 0 AND s.interval = c.level3_interval THEN 2
+                WHEN c.level4_interval > 0 AND s.interval = c.level4_interval THEN 3
+                ELSE 9
+            END,
+            s.[timestamp] DESC
+        ) AS rn
+    FROM monitor.PerfSample s
+    JOIN monitor.PerfInstance     i ON i.id = s.instance_id
+    JOIN monitor.PerfCounterInfo  c ON c.id = s.counter_id
+    JOIN monitor.Entity           e ON e.id = i.entity_id
+    JOIN metric_map               m ON m.string_id = c.string_id
+    WHERE s.[timestamp] >= DATEADD(minute, -@lookback, SYSUTCDATETIME())
+    )
+    SELECT host_name, role, counter_key, inst_lbl, instance_name, ts_utc, value_scaled
+    FROM base
+    WHERE rn = 1
+    AND host_name IS NOT NULL;";
 
         var list = new List<MRow>();
+        using var conn = new SqlConnection(_cfg.SqlConnectionString);
+        await conn.OpenAsync(ct);
         using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.Parameters.Add(new SqlParameter("@lookback", System.Data.SqlDbType.Int)
-        {
-            Value = Math.Max(1, _cfg.LookbackMinutes)
-        });
+        { Value = Math.Max(1, _cfg.LookbackMinutes) });
 
         using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct))
@@ -482,4 +447,5 @@ WHERE rn = 1
         }
         return list;
     }
+
 }
