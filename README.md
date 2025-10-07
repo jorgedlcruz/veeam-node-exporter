@@ -8,6 +8,12 @@ Prometheus exporter that reads recent performance counters from a Veeam ONE data
 - Endpoints: `/metrics` and `/debug`
 - Default listen URL: `http://127.0.0.1:9108/`
 
+## Screenshot
+
+![Dashboard preview](./veeamone-node-exporter.png)
+
+After you finish the tutorial, and when you send the metrics to some database, for example InfluxDB, you can have a view like this, built using InfluxDB v2, and telegraf as collector.
+
 ## Requirements
 
 - Windows 10 or later, or Windows Server 2019 or later
